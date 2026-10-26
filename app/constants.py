@@ -1,0 +1,90 @@
+"""应用与设备协议的公共常量。"""
+
+from __future__ import annotations
+
+APP_NAME = "NiceDog 脑电采集上位机"
+APP_VERSION = "1.0.0"
+PROTOCOL_NAME = "ADS1299 USB-CDC Binary V1"
+
+# 设备原始通道顺序（与固件二进制 payload 的 8 个 int32 一一对应）。
+CHANNELS_RAW: tuple[str, ...] = ("C1", "C3", "CZ", "C2", "C4", "AF8", "FPZ", "AF7")
+# 固件 ASCII 输出与界面习惯使用的显示顺序，元素为 CHANNELS_RAW 的下标。
+DISPLAY_ORDER: tuple[int, ...] = (4, 3, 2, 0, 1, 7, 6, 5)
+CHANNELS_DISPLAY: tuple[str, ...] = tuple(CHANNELS_RAW[i] for i in DISPLAY_ORDER)
+
+SAMPLE_RATE = 250
+EEG_GAIN = 24
+SUPPORTED_SAMPLE_RATES = (250, 500, 1000, 2000, 4000, 8000, 16000)
+SUPPORTED_GAINS = (1, 2, 4, 6, 8, 12, 24)
+SUPPORTED_BAUDRATES = (115_200, 230_400, 460_800, 921_600)
+DEFAULT_BAUDRATE = 460_800
+
+# WiFi 模块串口透传：电脑端模块虚拟串口默认 1,000,000 bps 8N1，固件目标 250 SPS。
+WIFI_SAMPLE_RATE = 250
+DEFAULT_WIFI_BAUDRATE = 1_000_000
+WIFI_BAUDRATES = (1_000_000, 921_600, 460_800, 115_200)
+
+DEVICE_VID = 0x0483
+DEVICE_PID = 0x5740
+
+# 帧同步与类型。
+SYNC_BYTES = b"\x55\xAA"
+TYPE_EEG = 0x01
+TYPE_IMU = 0x02
+TYPE_IMPEDANCE = 0x03
+TYPE_STATUS = 0x04
+TYPE_AUX = 0x05
+TYPE_COMMAND = 0x10
+TYPE_COMMAND_RESPONSE = 0x11
+TYPE_FILE = 0x20
+
+# 命令 ID。
+CMD_START_STREAM = 0x01
+CMD_STOP_STREAM = 0x02
+CMD_SET_CONFIG = 0x03
+CMD_GET_STATE = 0x04
+CMD_LIST_FILES = 0x05
+CMD_GET_FILE = 0x06
+CMD_DELETE_FILE = 0x07
+CMD_ENABLE_DEVICE = 0x0B
+CMD_DISABLE_DEVICE = 0x0C
+CMD_AUTO_STREAM = 0x0D
+CMD_TEST_IMPEDANCE = 0x0E
+CMD_CLEAR_DATA = 0x11
+CMD_PAUSE = 0x12
+CMD_RESUME = 0x13
+CMD_STOP_IMPEDANCE = 0x14
+
+COMMAND_NAMES: dict[int, str] = {
+    CMD_START_STREAM: "开始数据流",
+    CMD_STOP_STREAM: "停止数据流",
+    CMD_SET_CONFIG: "配置采集参数",
+    CMD_GET_STATE: "查询设备状态",
+    CMD_LIST_FILES: "列出 SD 文件",
+    CMD_GET_FILE: "读取 SD 文件",
+    CMD_DELETE_FILE: "删除 SD 文件",
+    CMD_ENABLE_DEVICE: "使能设备",
+    CMD_DISABLE_DEVICE: "停用设备",
+    CMD_AUTO_STREAM: "自动流（写 SD）",
+    CMD_TEST_IMPEDANCE: "阻抗测试",
+    CMD_CLEAR_DATA: "清空 SD 数据",
+    CMD_PAUSE: "暂停采集",
+    CMD_RESUME: "恢复采集",
+    CMD_STOP_IMPEDANCE: "停止阻抗测试",
+}
+
+DEVICE_STATE_NAMES: dict[int, str] = {
+    1: "已就绪",
+    2: "电量低",
+    3: "采集中",
+    4: "未连接",
+    5: "已停用",
+}
+
+# 显示与分析默认值。
+DEFAULT_WINDOW_S = 10
+DEFAULT_SCALE_UV = 100.0
+DEFAULT_FILTER_LOW = 0.5
+DEFAULT_FILTER_HIGH = 45.0
+DEFAULT_NOTCH = 50
+RING_SECONDS = 60
