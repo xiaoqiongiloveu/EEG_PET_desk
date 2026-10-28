@@ -36,6 +36,7 @@ from ..protocol import (
     parse_status_payload,
 )
 from .base import AcquisitionWorker, StreamConfig
+from .loss import StreamLossTracker
 from .port_scan import resolve_port
 
 # 命令之间的最小发送间隔，避免连续写把固件命令队列打满。
@@ -47,6 +48,9 @@ SLOW_COMMANDS = (CMD_STOP_STREAM, CMD_STOP_IMPEDANCE, CMD_DISABLE_DEVICE)
 USB_READY_TIMEOUT_S = 3.0
 WIFI_READY_TIMEOUT_S = 6.0
 
+# 采集中定期查询设备状态，用于读取设备端的丢包计数器（长时测试跟踪用）。
+STATUS_POLL_INTERVAL_S = 5.0
+
 
 class SerialWorker(AcquisitionWorker):
     """独占一个串口，读取 55AA 帧并批量向上层推送。"""
@@ -57,17 +61,16 @@ class SerialWorker(AcquisitionWorker):
         self.port = ""
         self._serial: serial.Serial | None = None
         self._parser = FrameParser()
-        self._commands: queue.Queue[tuple[int, bytes]] = queue.Queue()
+        self._commands: queue.Queue[tuple[int, bytes, bool]] = queue.Queue()
         self._stop_requested = False
         self._device_ready = False
         self._ready_deadline = 0.0
 
         self._command_sequence = 0
         self._next_send_time = 0.0
+        self._next_status_poll = 0.0
 
-        self._last_sequence: int | None = None
-        self._sequence_gaps = 0
-        self._dropped_samples = 0
+        self._loss = StreamLossTracker(config.sample_rate)
         self._frames = 0
         self._samples = 0
         self._bytes_received = 0
@@ -76,6 +79,12 @@ class SerialWorker(AcquisitionWorker):
         self._last_stats_time = 0.0
         self._last_stats_frames = 0
         self._last_stats_samples = 0
+
+        # 设备端计数器（相对本次连接首个状态帧的增量）。
+        self._device_base: tuple[int, int, int] | None = None
+        self._device_drops = 0
+        self._device_link_errors = 0
+        self._device_report_valid = False
 
         self._clock_host: float | None = None
         self._clock_elapsed_ms = 0.0
@@ -93,29 +102,35 @@ class SerialWorker(AcquisitionWorker):
         self._stop_requested = True
 
     def start_stream(self) -> None:
-        self._commands.put((CMD_START_STREAM, b""))
+        self._enqueue(CMD_START_STREAM)
 
     def stop_stream(self) -> None:
-        self._commands.put((CMD_STOP_STREAM, b""))
+        self._enqueue(CMD_STOP_STREAM)
 
     def start_impedance(self) -> None:
-        self._commands.put((CMD_TEST_IMPEDANCE, b""))
+        self._enqueue(CMD_TEST_IMPEDANCE)
         self.log_message.emit("已请求阻抗测试，等待设备返回数据")
 
     def stop_impedance(self) -> None:
-        self._commands.put((CMD_STOP_IMPEDANCE, b""))
+        self._enqueue(CMD_STOP_IMPEDANCE)
 
     def query_state(self) -> None:
-        self._commands.put((CMD_GET_STATE, b""))
+        self._enqueue(CMD_GET_STATE)
 
     def send_command(self, command_id: int, payload: bytes = b"") -> None:
-        self._commands.put((int(command_id) & 0xFF, bytes(payload)))
+        self._enqueue(command_id, payload)
 
     def apply_config(self, sample_rate: int, gain: int) -> None:
         self.config.sample_rate = int(sample_rate)
         self.config.gain = int(gain)
+        self._loss.sample_rate = float(sample_rate)
         payload = build_config_payload(sample_rate, gain)
-        self._commands.put((CMD_SET_CONFIG, payload))
+        self._enqueue(CMD_SET_CONFIG, payload)
+
+    def _enqueue(self, command_id: int, payload: bytes = b"", silent: bool = False) -> None:
+        """silent=True 用于周期性轮询，不写日志、不刷屏。"""
+
+        self._commands.put((int(command_id) & 0xFF, bytes(payload), bool(silent)))
 
     # ------------------------------------------------------------------ 线程
     def run(self) -> None:  # noqa: C901 - 采集主循环
@@ -157,12 +172,17 @@ class SerialWorker(AcquisitionWorker):
         )
         self._start_time = time.monotonic()
         self._last_stats_time = self._start_time
+        self._next_status_poll = self._start_time + STATUS_POLL_INTERVAL_S
 
         try:
             self._bootstrap()
             while not self._stop_requested:
                 now = time.monotonic()
                 self._drain_commands(now)
+                if now >= self._next_status_poll:
+                    # 静默轮询设备状态，读取设备端丢包计数器。
+                    self._enqueue(CMD_GET_STATE, silent=True)
+                    self._next_status_poll = now + STATUS_POLL_INTERVAL_S
                 waiting = self._serial.in_waiting
                 data = self._serial.read(waiting if waiting > 0 else 1)
                 if data:
@@ -221,20 +241,22 @@ class SerialWorker(AcquisitionWorker):
         if now < self._next_send_time or self._serial is None:
             return
         try:
-            command_id, payload = self._commands.get_nowait()
+            command_id, payload, silent = self._commands.get_nowait()
         except queue.Empty:
             return
-        self._write_command(command_id, payload)
+        self._write_command(command_id, payload, silent=silent)
         gap = SLOW_COMMAND_GAP_S if command_id in SLOW_COMMANDS else COMMAND_GAP_S
         self._next_send_time = now + gap
 
-    def _write_command(self, command_id: int, payload: bytes = b"") -> None:
+    def _write_command(self, command_id: int, payload: bytes = b"", silent: bool = False) -> None:
         if self._serial is None:
             return
         self._command_sequence = (self._command_sequence + 1) & 0xFFFF
         frame = build_command_frame(command_id, self._command_sequence, payload)
         self._serial.write(frame)
         self._serial.flush()
+        if silent:
+            return
         name = COMMAND_NAMES.get(command_id, f"0x{command_id:02X}")
         self.log_message.emit(f"→ {name}")
 
@@ -258,9 +280,12 @@ class SerialWorker(AcquisitionWorker):
                     self.log_message.emit(f"阻抗数据异常: {exc}")
             elif frame.packet_type == TYPE_STATUS:
                 try:
-                    self.status_received.emit(parse_status_payload(frame.payload))
+                    status = parse_status_payload(frame.payload)
                 except ValueError as exc:
                     self.log_message.emit(f"状态数据异常: {exc}")
+                else:
+                    self._update_device_counters(status)
+                    self.status_received.emit(status)
             elif frame.packet_type == TYPE_AUX:
                 try:
                     self.aux_received.emit(parse_aux_payload(frame.payload))
@@ -278,6 +303,22 @@ class SerialWorker(AcquisitionWorker):
                     detail = f" {response.message}" if response.message else ""
                     self.log_message.emit(f"← {name} {result}{detail}")
 
+    def _update_device_counters(self, status) -> None:
+        """把设备端累加计数器换算成本次连接内的增量。"""
+
+        if not status.link_stats:
+            return
+        current = (status.ads_drops, status.wireless_tx_overflow, status.wireless_rx_overflow)
+        if self._device_base is None:
+            self._device_base = current
+            self._device_report_valid = True
+            return
+        base_drops, base_tx, base_rx = self._device_base
+        # 设备计数为 32 位无符号数，用掩码处理回绕。
+        self._device_drops = (current[0] - base_drops) & 0xFFFFFFFF
+        self._device_link_errors = ((current[1] - base_tx) + (current[2] - base_rx)) & 0xFFFFFFFF
+        self._device_report_valid = True
+
     def _handle_eeg(self, frame) -> None:
         try:
             parsed = parse_eeg_payload(frame.payload, self.config.gain)
@@ -285,12 +326,7 @@ class SerialWorker(AcquisitionWorker):
             self.log_message.emit(f"EEG 数据异常: {exc}")
             return
         self._samples += 1
-        if self._last_sequence is not None:
-            gap = (frame.sequence - self._last_sequence - 1) & 0xFFFF
-            if 0 < gap < 1000:
-                self._sequence_gaps += 1
-                self._dropped_samples += gap
-        self._last_sequence = frame.sequence
+        self._loss.update(frame.sequence, frame.device_timestamp_ms)
 
         timestamp = self._device_timestamp(frame.device_timestamp_ms)
         if not self._batch_values:
@@ -338,14 +374,21 @@ class SerialWorker(AcquisitionWorker):
 
     def _emit_stats(self, now: float) -> None:
         elapsed = max(now - self._last_stats_time, 1e-6)
+        lost = self._loss.lost_by_seq
         stats = AcquisitionStats(
             frames=self._frames,
             samples=self._samples,
             bytes_received=self._bytes_received,
             crc_errors=self._parser.crc_errors,
             malformed_frames=self._parser.malformed_frames,
-            sequence_gaps=self._sequence_gaps,
-            dropped_samples=self._dropped_samples,
+            sequence_gaps=self._loss.gaps,
+            lost_by_seq=lost,
+            lost_by_time=self._loss.lost_by_time,
+            loss_rate=self._loss.loss_rate(self._samples),
+            outages=self._loss.outages,
+            device_drops=self._device_drops,
+            device_link_errors=self._device_link_errors,
+            device_report_valid=self._device_report_valid,
             frame_rate=(self._frames - self._last_stats_frames) / elapsed,
             sample_rate=(self._samples - self._last_stats_samples) / elapsed,
             elapsed_s=now - self._start_time,

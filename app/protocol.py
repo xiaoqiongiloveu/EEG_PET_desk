@@ -211,20 +211,32 @@ class DeviceStatus:
     pb_status: int = 0
     firmware: str = ""
     serial_no: str = ""
+    # 固件扩展块（"ND" 标记）中的丢包计数器，设备上电后累计。
+    ads_drops: int = 0
+    wireless_tx_overflow: int = 0
+    wireless_rx_overflow: int = 0
+    link_stats: bool = False
     raw: bytes = field(default=b"", repr=False)
 
 
+LINK_STATS_MAGIC = b"ND"
+LINK_STATS_SIZE = 14  # magic(2) + ads_drops(4) + tx_overflow(4) + rx_overflow(4)
+
+
 def parse_status_payload(payload: bytes) -> DeviceStatus:
-    """兼容固件当前布局与旧版文档布局。"""
+    """兼容固件当前布局与旧版文档布局。
+
+    固件在固件版本号与序列号之后追加了 ``"ND"`` 扩展块：
+        'N','D' | ads_drops(u32 LE) | wireless_tx_overflow(u32 LE) | wireless_rx_overflow(u32 LE)
+    旧固件没有该块，解析结果中 ``link_stats`` 为 False。
+    """
 
     if len(payload) >= 11:
         battery = int.from_bytes(payload[3:5], "little") / 100.0
         blob = payload[11:]
-        if b"\x00" in blob:
-            ver_raw, sn_raw = blob.split(b"\x00", 1)
-        else:
-            ver_raw, sn_raw = blob, b""
-        return DeviceStatus(
+        ver_raw, _, rest = blob.partition(b"\x00")
+        sn_raw, _, trailer = rest.partition(b"\x00")
+        status = DeviceStatus(
             device_type=payload[0],
             sd_usage_percent=payload[1],
             sd_ok=bool(payload[2]),
@@ -236,6 +248,12 @@ def parse_status_payload(payload: bytes) -> DeviceStatus:
             serial_no=sn_raw.decode("ascii", errors="replace"),
             raw=payload,
         )
+        if len(trailer) >= LINK_STATS_SIZE and trailer[:2] == LINK_STATS_MAGIC:
+            status.ads_drops = int.from_bytes(trailer[2:6], "little")
+            status.wireless_tx_overflow = int.from_bytes(trailer[6:10], "little")
+            status.wireless_rx_overflow = int.from_bytes(trailer[10:14], "little")
+            status.link_stats = True
+        return status
     if len(payload) >= 5:
         return DeviceStatus(
             sd_ok=bool(payload[2]),

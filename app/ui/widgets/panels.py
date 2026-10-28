@@ -100,7 +100,18 @@ class StatusPanel(CardWidget):
         layout.setSpacing(4)
         layout.addWidget(StrongBodyLabel("设备状态", self))
         self.labels: dict[str, BodyLabel] = {}
-        for key in ("连接", "模式", "设备", "电量", "SD 卡", "数据率", "丢包", "CRC 错误", "记录"):
+        for key in (
+            "连接",
+            "模式",
+            "设备",
+            "电量",
+            "SD 卡",
+            "数据率",
+            "丢包",
+            "丢包率",
+            "CRC 错误",
+            "记录",
+        ):
             row = QHBoxLayout()
             caption = CaptionLabel(f"{key}", self)
             caption.setFixedWidth(64)
@@ -138,12 +149,21 @@ class StatusPanel(CardWidget):
 
     def set_stats(self, stats: AcquisitionStats) -> None:
         self._set("数据率", f"{stats.sample_rate:.1f} Hz / {stats.frame_rate:.1f} 帧/s")
-        drop_color = GOOD_COLOR if stats.sequence_gaps == 0 else WARN_COLOR
-        self._set(
-            "丢包",
-            f"缺口 {stats.sequence_gaps}，丢样 {stats.dropped_samples}",
-            drop_color,
-        )
+        drop_color = GOOD_COLOR if stats.lost_by_seq == 0 and stats.device_drops == 0 else WARN_COLOR
+        detail = f"丢样 {stats.lost_by_seq}（缺口 {stats.sequence_gaps} 次）"
+        if stats.device_report_valid:
+            detail += f"，设备端 {stats.device_drops}"
+        self._set("丢包", detail, drop_color)
+
+        rate = stats.loss_rate * 100.0
+        if rate <= 0.0:
+            rate_color = GOOD_COLOR
+        elif rate < 1.0:
+            rate_color = WARN_COLOR
+        else:
+            rate_color = BAD_COLOR
+        self._set("丢包率", f"{rate:.4f}%（断流 {stats.outages} 次）", rate_color)
+
         crc_color = GOOD_COLOR if stats.crc_errors == 0 else BAD_COLOR
         self._set(
             "CRC 错误",

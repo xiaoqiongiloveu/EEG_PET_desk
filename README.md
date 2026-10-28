@@ -55,6 +55,7 @@ sessions/20260304_153000/
   session.json      元数据与统计
   samples.bin       float32 交错采样（原始未滤波）
   timestamps.bin    float64 相对时间戳（秒）
+  stats.csv         每秒一行的丢包/速率统计（长时测试用）
   events.jsonl      标记与状态事件
   commands.log      下发命令
   impedance.tsv     阻抗记录

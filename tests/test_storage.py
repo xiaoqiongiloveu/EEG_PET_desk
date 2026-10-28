@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import time
 import unittest
@@ -9,6 +10,7 @@ from pathlib import Path
 
 import numpy as np
 
+from app.core.models import AcquisitionStats
 from app.storage import SessionReader, SessionRecorder, list_sessions
 
 
@@ -44,6 +46,33 @@ class StorageTest(unittest.TestCase):
             self.assertTrue(any(event["kind"] == "marker" for event in events))
             self.assertEqual(reader.read_impedance().shape, (1, 9))
             self.assertEqual(len(reader.read_commands()), 1)
+
+    def test_loss_stats_are_persisted(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            recorder = SessionRecorder(root, {"sample_rate": 250, "gain": 24}, ["C1"])
+            recorder.append_stats(
+                AcquisitionStats(
+                    frames=250,
+                    samples=250,
+                    lost_by_seq=3,
+                    lost_by_time=4,
+                    loss_rate=3 / 253,
+                    sequence_gaps=2,
+                    outages=1,
+                    sample_rate=249.8,
+                    frame_rate=250.0,
+                )
+            )
+            path = recorder.stop()
+
+            header, row = (path / "stats.csv").read_text(encoding="utf-8").splitlines()
+            self.assertTrue(header.startswith("time_s,frames,samples,lost_by_seq"))
+            self.assertIn(",3,4,", row)
+
+            summary = json.loads((path / "session.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["loss_summary"]["lost_by_seq"], 3)
+            self.assertEqual(summary["loss_summary"]["outages"], 1)
 
     def test_empty_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

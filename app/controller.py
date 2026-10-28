@@ -123,7 +123,7 @@ class AcquisitionController(QObject):
         worker.impedance_received.connect(self._on_impedance)
         worker.status_received.connect(self._on_status)
         worker.aux_received.connect(self._on_aux)
-        worker.stats_received.connect(self.stats_updated)
+        worker.stats_received.connect(self._on_stats)
         worker.command_response.connect(self._on_response)
         worker.log_message.connect(self._on_log)
         worker.error_occurred.connect(self._on_error)
@@ -208,11 +208,17 @@ class AcquisitionController(QObject):
     def start_recording(self) -> str | None:
         if self.recorder is not None:
             return str(self.recorder.path)
+        # 以工作线程的实际配置为准，避免设置页改值后与实际数据流不一致。
+        worker_config = getattr(self.worker, "config", None)
+        sample_rate = int(getattr(worker_config, "sample_rate", self.settings.sample_rate))
+        gain = int(getattr(worker_config, "gain", self.settings.gain))
         metadata = {
             "source": self.source,
             "mode": self._mode,
             "device": getattr(self.worker, "port", "") if self.source == "serial" else "SIMULATOR",
             "baudrate": self._active_baudrate,
+            "sample_rate": sample_rate,
+            "gain": gain,
             "firmware": getattr(self, "_firmware", ""),
             "serial_no": getattr(self, "_serial_no", ""),
             "filter": {
@@ -280,6 +286,11 @@ class AcquisitionController(QObject):
             sequences=batch.sequences,
         )
         self.samples_ready.emit(out)
+
+    def _on_stats(self, stats) -> None:
+        if self.recorder is not None:
+            self.recorder.append_stats(stats)
+        self.stats_updated.emit(stats)
 
     def _on_impedance(self, values) -> None:
         self.impedance_updated.emit(values)

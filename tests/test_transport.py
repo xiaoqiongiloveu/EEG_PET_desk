@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import struct
+import time
 import unittest
 from unittest import mock
 
@@ -22,6 +23,7 @@ from app.constants import (
 from app.controller import AcquisitionController
 from app.protocol import FrameParser, pack_frame
 from app.transport.base import StreamConfig
+from app.transport.loss import StreamLossTracker
 from app.transport.port_scan import PortInfo, resolve_port
 from app.transport.serial_worker import SerialWorker
 
@@ -213,6 +215,87 @@ class SerialWorkerTests(unittest.TestCase):
         self.assertEqual(errors2, [])
         self.assertEqual(ready2, ["COM7"])
         self.assertEqual(events2, [(True, "COM7"), (False, "")])
+
+
+class LossTrackerTests(unittest.TestCase):
+    """丢包口径：序号跳变、16 位回绕、时间戳跳变与断流。"""
+
+    def test_no_gap_means_no_loss(self) -> None:
+        tracker = StreamLossTracker(250)
+        for index in range(10):
+            tracker.update(index, index * 4)
+        self.assertEqual(tracker.lost_by_seq, 0)
+        self.assertEqual(tracker.lost_by_time, 0)
+        self.assertEqual(tracker.loss_rate(10), 0.0)
+
+    def test_sequence_gap_counts_missing_frames(self) -> None:
+        tracker = StreamLossTracker(250)
+        tracker.update(100, 0)
+        tracker.update(103, 12)
+        self.assertEqual(tracker.lost_by_seq, 2)
+        self.assertEqual(tracker.gaps, 1)
+        self.assertEqual(tracker.outages, 0)
+        self.assertAlmostEqual(tracker.loss_rate(1), 2 / 3)
+
+    def test_sequence_wrap_around(self) -> None:
+        tracker = StreamLossTracker(250)
+        tracker.update(0xFFFE, 0)
+        tracker.update(0x0001, 12)
+        self.assertEqual(tracker.lost_by_seq, 2)
+        self.assertEqual(tracker.outages, 0)
+
+    def test_long_outage_is_not_counted_as_loss(self) -> None:
+        tracker = StreamLossTracker(250)
+        tracker.update(10, 0)
+        # 250 SPS 下 10 秒约 2500 个样点，序号与时间戳同时超限只记一次断流。
+        tracker.update(10 + 2000 + 3000, 12000)
+        self.assertEqual(tracker.lost_by_seq, 0)
+        self.assertEqual(tracker.lost_by_time, 0)
+        self.assertEqual(tracker.outages, 1)
+
+    def test_timestamp_gap_detects_device_side_drop(self) -> None:
+        tracker = StreamLossTracker(250)
+        tracker.update(1, 0)
+        tracker.update(2, 8)  # 少了一个 4 ms 周期
+        self.assertEqual(tracker.lost_by_time, 1)
+        self.assertEqual(tracker.lost_by_seq, 0)
+
+    def test_timestamp_jitter_is_ignored(self) -> None:
+        tracker = StreamLossTracker(250)
+        for index, ts in enumerate((0, 3, 5, 8, 12)):
+            tracker.update(index, ts)
+        self.assertEqual(tracker.lost_by_time, 0)
+
+    def test_timestamp_rollback_counts_as_outage(self) -> None:
+        tracker = StreamLossTracker(250)
+        tracker.update(1, 1_000_000)
+        tracker.update(2, 400)
+        self.assertEqual(tracker.outages, 1)
+        self.assertEqual(tracker.lost_by_time, 0)
+
+    def test_high_sample_rate_skips_timestamp_check(self) -> None:
+        # 16 kSPS 时采样周期远小于 1 ms 时间戳分辨率，只保留序号口径。
+        tracker = StreamLossTracker(16000)
+        tracker.update(1, 0)
+        tracker.update(2, 1)
+        self.assertEqual(tracker.lost_by_time, 0)
+        self.assertEqual(tracker.outages, 0)
+
+    def test_worker_reports_loss_and_rate(self) -> None:
+        config = StreamConfig(port="COM7", baudrate=115_200, sample_rate=250)
+        worker = SerialWorker(config)
+        captured: list = []
+        worker.stats_received.connect(captured.append)
+        parser = FrameParser()
+        for sequence, timestamp in ((1, 0), (2, 4), (5, 16)):
+            worker._handle_eeg(parser.feed(_eeg_frame(sequence, timestamp))[0])
+        worker._emit_stats(time.monotonic())
+
+        stats = captured[-1]
+        self.assertEqual(stats.lost_by_seq, 2)
+        self.assertEqual(stats.sequence_gaps, 1)
+        self.assertAlmostEqual(stats.loss_rate, 2 / 5)
+        self.assertFalse(stats.device_report_valid)
 
 
 class FakeWorker(QObject):

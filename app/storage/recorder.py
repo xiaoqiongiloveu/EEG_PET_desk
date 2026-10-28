@@ -5,6 +5,7 @@
         session.json     元数据与统计
         samples.bin      float32 交错采样 (n, 8)
         timestamps.bin   float64 主机时间戳 (n,)
+        stats.csv        每秒一行的丢包/速率统计
         events.jsonl     事件流
         commands.log     下发的命令
         impedance.tsv    阻抗记录
@@ -24,6 +25,23 @@ import numpy as np
 
 SAMPLE_DTYPE = np.dtype("<f4")
 TIMESTAMP_DTYPE = np.dtype("<f8")
+
+# 每秒一行的丢包统计，便于长时测试后直接画曲线或做交叉核对。
+STATS_COLUMNS = (
+    "time_s",
+    "frames",
+    "samples",
+    "lost_by_seq",
+    "lost_by_time",
+    "loss_rate",
+    "sequence_gaps",
+    "outages",
+    "crc_errors",
+    "device_drops",
+    "device_link_errors",
+    "sample_rate",
+    "frame_rate",
+)
 
 
 class SessionRecorder:
@@ -52,6 +70,8 @@ class SessionRecorder:
         self._commands_file = open(path / "commands.log", "a", encoding="utf-8")
         self._impedance_file = open(path / "impedance.tsv", "w", encoding="utf-8", newline="")
         self._impedance_file.write("time_s\t" + "\t".join(self.channel_names) + "\n")
+        self._stats_file = open(path / "stats.csv", "w", encoding="utf-8", newline="")
+        self._stats_file.write(",".join(STATS_COLUMNS) + "\n")
         (path / "notes.txt").write_text("", encoding="utf-8")
 
         self._meta = {
@@ -65,6 +85,7 @@ class SessionRecorder:
         self._queue: queue.Queue = queue.Queue(maxsize=2048)
         self._sample_count = 0
         self._impedance_count = 0
+        self._last_stats: dict | None = None
         self._closed = False
         self._error = ""
         self._thread = threading.Thread(target=self._writer_loop, name="SessionWriter", daemon=True)
@@ -106,6 +127,32 @@ class SessionRecorder:
         relative = float(timestamp) - self._time_origin_of(float(timestamp))
         self._queue.put(("impedance", np.asarray(values, dtype=np.float64).copy(), relative))
 
+    def append_stats(self, stats) -> None:
+        """每秒追加一行采集/丢包统计。"""
+
+        if self._closed:
+            return
+        row = {
+            "time_s": round(self.elapsed_s, 3),
+            "frames": int(stats.frames),
+            "samples": int(stats.samples),
+            "lost_by_seq": int(stats.lost_by_seq),
+            "lost_by_time": int(stats.lost_by_time),
+            "loss_rate": round(float(stats.loss_rate), 8),
+            "sequence_gaps": int(stats.sequence_gaps),
+            "outages": int(stats.outages),
+            "crc_errors": int(stats.crc_errors),
+            "device_drops": int(stats.device_drops),
+            "device_link_errors": int(stats.device_link_errors),
+            "sample_rate": round(float(stats.sample_rate), 3),
+            "frame_rate": round(float(stats.frame_rate), 3),
+        }
+        self._last_stats = row
+        try:
+            self._queue.put_nowait(("stats", row))
+        except queue.Full:
+            self._error = "记录队列已满，部分统计未写入"
+
     def _time_origin_of(self, timestamp: float) -> float:
         """记录第一个数据点的时间，作为会话相对时间 0 点。"""
         if self._time_origin is None:
@@ -142,6 +189,7 @@ class SessionRecorder:
             self._events_file,
             self._commands_file,
             self._impedance_file,
+            self._stats_file,
         ):
             try:
                 handle.close()
@@ -153,6 +201,7 @@ class SessionRecorder:
                 "duration_s": round(time.time() - self.started_at, 3),
                 "sample_count": self._sample_count,
                 "impedance_count": self._impedance_count,
+                "loss_summary": self._last_stats,
                 "error": self._error,
             }
         )
@@ -188,6 +237,10 @@ class SessionRecorder:
         elif kind == "event":
             self._events_file.write(json.dumps(item[1], ensure_ascii=False) + "\n")
             self._events_file.flush()
+        elif kind == "stats":
+            row = item[1]
+            self._stats_file.write(",".join(str(row[key]) for key in STATS_COLUMNS) + "\n")
+            self._stats_file.flush()
         elif kind == "command":
             self._commands_file.write(item[1] + "\n")
             self._commands_file.flush()

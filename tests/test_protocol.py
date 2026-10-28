@@ -139,6 +139,22 @@ class PayloadTests(unittest.TestCase):
         self.assertEqual(status.firmware, "T1.0.1")
         self.assertEqual(status.serial_no, "AIT2601X0456")
 
+    def test_status_payload_link_stats_block(self) -> None:
+        payload = bytearray(11 + 6 + 12)
+        payload[0] = 1
+        struct.pack_into("<H", payload, 3, 402)
+        payload[11:17] = b"T4.1.0"
+        payload[17] = 0
+        payload[18:30] = b"AIT2601X0456"
+        # 固件扩展块：SN 结束符 + 'N','D' + ads_drops + tx 溢出 + rx 溢出
+        payload += b"\x00ND" + struct.pack("<III", 12, 3, 4)
+        status = parse_status_payload(bytes(payload))
+        self.assertEqual(status.serial_no, "AIT2601X0456")
+        self.assertTrue(status.link_stats)
+        self.assertEqual(status.ads_drops, 12)
+        self.assertEqual(status.wireless_tx_overflow, 3)
+        self.assertEqual(status.wireless_rx_overflow, 4)
+
     def test_command_response(self) -> None:
         raw = pack_frame(TYPE_COMMAND_RESPONSE, 0, 1, b"\x03\x00Config Updated")
         frame = FrameParser().feed(raw)[0]

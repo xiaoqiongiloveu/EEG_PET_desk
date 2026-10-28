@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -20,7 +21,11 @@ from .constants import (
     SAMPLE_RATE,
 )
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if getattr(sys, "frozen", False):
+    # 打包后以 exe 所在目录为根，避免配置与会话写进临时解压目录。
+    PROJECT_ROOT = Path(sys.executable).resolve().parent
+else:
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_DIR = PROJECT_ROOT / "config"
 SETTINGS_PATH = CONFIG_DIR / "settings.json"
 

@@ -12,6 +12,11 @@ venv/
 config/settings.json
 sessions/
 
+# 打包产物与临时备份（不入库）
+build/
+dist/
+*.bak
+
 # 系统与编辑器
 .DS_Store
 Thumbs.db
